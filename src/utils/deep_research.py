@@ -15,12 +15,16 @@ import json
 import re
 from browser_use.agent.service import Agent
 from browser_use.browser.browser import BrowserConfig, Browser
+from browser_use.agent.views import ActionResult
+from browser_use.browser.context import BrowserContext
+from browser_use.controller.service import Controller, DoneAction
+from main_content_extractor import MainContentExtractor
 from langchain.schema import SystemMessage, HumanMessage
 from json_repair import repair_json
 from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
 from src.controller.custom_controller import CustomController
 from src.browser.custom_browser import CustomBrowser
-from src.browser.custom_context import BrowserContextConfig
+from src.browser.custom_context import BrowserContextConfig, BrowserContext
 from browser_use.browser.context import (
     BrowserContextConfig,
     BrowserContextWindowSize,
@@ -64,6 +68,27 @@ async def deep_research(task, llm, agent_state=None, **kwargs):
         browser_context = None
 
     controller = CustomController()
+
+    @controller.registry.action(
+        'Extract page content to get the pure markdown.',
+    )
+    async def extract_content(browser: BrowserContext):
+        page = await browser.get_current_page()
+        # use jina reader
+        url = page.url
+
+        jina_url = f"https://r.jina.ai/{url}"
+        await page.goto(jina_url)
+        output_format = 'markdown'
+        content = MainContentExtractor.extract(  # type: ignore
+            html=await page.content(),
+            output_format=output_format,
+        )
+        # go back to org url
+        await page.go_back()
+        msg = f'Extracted page content:\n {content}\n'
+        logger.info(msg)
+        return ActionResult(extracted_content=msg)
 
     search_system_prompt = f"""
     You are a **Deep Researcher**, an AI agent specializing in in-depth information gathering and research using a web browser with **automated execution capabilities**. Your expertise lies in formulating comprehensive research plans and executing them meticulously to fulfill complex user requests. You will analyze user instructions, devise a detailed research plan, and determine the necessary search queries to gather the required information.
@@ -200,8 +225,7 @@ Provide your output as a JSON formatted list. Each item in the list must adhere 
                     system_prompt_class=CustomSystemPrompt,
                     agent_prompt_class=CustomAgentMessagePrompt,
                     max_actions_per_step=5,
-                    controller=controller,
-                    agent_state=agent_state
+                    controller=controller
                 )
                 agent_result = await agent.run(max_steps=kwargs.get("max_steps", 10))
                 query_results = [agent_result]
@@ -224,7 +248,6 @@ Provide your output as a JSON formatted list. Each item in the list must adhere 
                     agent_prompt_class=CustomAgentMessagePrompt,
                     max_actions_per_step=5,
                     controller=controller,
-                    agent_state=agent_state
                 ) for task in query_tasks]
                 query_results = await asyncio.gather(
                     *[agent.run(max_steps=kwargs.get("max_steps", 10)) for agent in agents])
@@ -265,10 +288,30 @@ Provide your output as a JSON formatted list. Each item in the list must adhere 
                     record_content = repair_json(record_content)
                     new_record_infos = json.loads(record_content)
                     history_infos.extend(new_record_infos)
+            if agent_state and agent_state.is_stop_requested():
+                # Stop
+                break
 
         logger.info("\nFinish Searching, Start Generating Report...")
 
         # 5. Report Generation in Markdown (or JSON if you prefer)
+        return await generate_final_report(task, history_infos, save_dir, llm)
+
+    except Exception as e:
+        logger.error(f"Deep research Error: {e}")
+        return await generate_final_report(task, history_infos, save_dir, llm, str(e))
+    finally:
+        if browser:
+            await browser.close()
+        if browser_context:
+            await browser_context.close()
+        logger.info("Browser closed.")
+
+async def generate_final_report(task, history_infos, save_dir, llm, error_msg=None):
+    """Generate report from collected information with error handling"""
+    try:
+        logger.info("\nAttempting to generate final report from collected data...")
+        
         writer_system_prompt = """
         You are a **Deep Researcher** and a professional report writer tasked with creating polished, high-quality reports that fully meet the user's needs, based on the user's instructions and the relevant information provided. You will write the report using Markdown format, ensuring it is both informative and visually appealing.
 
@@ -314,21 +357,21 @@ Provide your output as a JSON formatted list. Each item in the list must adhere 
             logger.info(ai_report_msg.reasoning_content)
             logger.info("🤯 End Report Deep Thinking")
         report_content = ai_report_msg.content
-        # Remove ```markdown or ``` at the *very beginning* and ``` at the *very end*, with optional whitespace
         report_content = re.sub(r"^```\s*markdown\s*|^\s*```|```\s*$", "", report_content, flags=re.MULTILINE)
         report_content = report_content.strip()
+
+        # Add error notification to the report
+        if error_msg:
+            report_content = f"## ⚠️ Research Incomplete - Partial Results\n" \
+                            f"**The research process was interrupted by an error:** {error_msg}\n\n" \
+                            f"{report_content}"
+            
         report_file_path = os.path.join(save_dir, "final_report.md")
         with open(report_file_path, "w", encoding="utf-8") as f:
             f.write(report_content)
         logger.info(f"Save Report at: {report_file_path}")
         return report_content, report_file_path
 
-    except Exception as e:
-        logger.error(f"Deep research Error: {e}")
-        return "", None
-    finally:
-        if browser:
-            await browser.close()
-        if browser_context:
-            await browser_context.close()
-        logger.info("Browser closed.")
+    except Exception as report_error:
+        logger.error(f"Failed to generate partial report: {report_error}")
+        return f"Error generating report: {str(report_error)}", None
